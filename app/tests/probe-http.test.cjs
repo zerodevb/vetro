@@ -40,7 +40,7 @@ server.listen(0, '127.0.0.1', async () => {
       const res = {headers: {}, setHeader() {}, writeHead(code) {res.code = code;}, end(text) {resolve({code: res.code, text});}};
       service.router({method: 'POST', url: '/probe', headers: {}, socket: {remoteAddress: '192.0.2.5'}, on() {}}, res);
     });
-    assert.equal(remote.code, 403);
+    assert.equal(remote.code, 401);   // Garage sign-in refuses unpaired LAN clients before the route does
     assert.equal(JSON.parse((await request('GET', '/probe', 'null')).text).apps.length, 700);
     console.log('PASS widget probe HTTP: preflight, report round trip, opaque origin only, loopback writes only');
   } catch (e) {console.error(e); process.exitCode = 1;}

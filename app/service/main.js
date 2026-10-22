@@ -556,8 +556,11 @@ function handleRemapRun(req,res){readJsonBody(req,res,function(p){
     runActions(remap.resolve(remapStore.rules,p.type,p.value,p.payload)).then(function(r){serveJson(res,r);}).catch(function(e){serveJson(res,{ok:false,error:e.message},503);});
 });}
 
+var garageAuth = require('./garage-auth.js');
 http.createServer(function (req, res) {
     var url = (req.url || '/').split('?')[0];
+    // Local change for Garage Home: pairing sign-in for everything except apps on the TV itself.
+    if (garageAuth.gate(req, res, url, function () { runActions([{type: 'launch', appId: 'GarageHome.launcher'}]).catch(function () {}); })) return;
     if (url === '/diagnostics/download') {
         if (req.method !== 'GET') return serveJson(res, {error:'Use GET to download diagnostics'}, 405);
         return downloadDiagnostics(res);
@@ -623,7 +626,7 @@ http.createServer(function (req, res) {
     if (url === '/tv-settings') return Promise.all([tvSettings.read().catch(function(e){return {items:[],error:e.message}}),dnsFilter.status().catch(function(e){return {error:e.message}}),tvSettings.readNetwork().catch(function(e){return {configurationError:e.message,services:[],interfaces:[],writable:false}})]).then(function(d){serveJson(res,{ts:Date.now(),items:d[0].items,scope:d[0].scope,error:d[0].error||null,network:Object.assign({},d[1],d[2]),device:settings.sanitize(state.settings)});});
     if (url === '/settings') return handleSettings(req, res);
     if (url === '/remap') return handleRemap(req, res);
-    if (url === '/' || url === '/index.html') return serveHtml(res, dashboardHtml());
+    if (url === '/' || url === '/index.html') return serveHtml(res, garageAuth.decorate(dashboardHtml()));
     serveJson(res, { error: 'not found' }, 404);
 }).listen(PORT, function () {
     console.log('VETRO listening on ' + PORT);
