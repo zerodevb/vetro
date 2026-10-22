@@ -1,3 +1,7 @@
+> **This is a preserved fork for [Garage Home](https://github.com/zerodevb/garage-home) and [Garage Player](https://github.com/zerodevb/garage-player).**
+> Tag [`upstream-e8553f2`](https://github.com/zerodevb/vetro/tree/upstream-e8553f2) is the exact upstream version they were built on; branch `garage` adds remote-key watch, autostart, the phone playlist inbox and a playlist proxy (`app/service/garage-*.js`).
+> The original project is [andrearicci93/vetro](https://github.com/andrearicci93/vetro) (MIT). Powered by [TheGarageDevs.com](https://thegaragedevs.com).
+
 <p align="center">
   <img src="app/icon.png" alt="Vetro app icon" width="112">
 </p>
