@@ -470,11 +470,19 @@ function runActions(actions) {
 }
 var actionQueue=Promise.resolve(), pendingActions=0, inputError=null;
 var physical=new PhysicalInput(agentExecute,function(event){
-    if(event.action!=='down'||event.decision!=='blocked')return;
+    // Local change for Garage Home: "watch" listens without grabbing the remote (the key also reaches the TV) and still acts.
+    if(event.action!=='down'||(event.decision!=='blocked'&&!(event.mode==='observe'&&inputPreference().mode==='watch')))return;
     var actions=remap.resolve(remapStore.rules,'physical',String(event.code));
     if(pendingActions>=8){inputPaused=true;physical.stop();inputError='input action queue exceeded';return;}
     pendingActions++;
     actionQueue=actionQueue.then(function(){return runActions(actions);}).catch(function(e){inputError=e.message;inputPaused=true;physical.stop();}).finally(function(){pendingActions--;});
+});
+// Local change for Garage Home: watch mode listens to every remote input (see garage-watch.js).
+var garageWatch=require('./garage-watch.js').create(PhysicalInput,agentExecute,function(event){
+    var actions=remap.resolve(remapStore.rules,'physical',String(event.code));
+    if(!actions.length||pendingActions>=8)return;
+    pendingActions++;
+    actionQueue=actionQueue.then(function(){return runActions(actions);}).catch(function(e){inputError=e.message;}).finally(function(){pendingActions--;});
 });
 var inputObservers=[], inputPaused=false, inputRestoring=false;
 function inputPreference(){var p=remapStore.input;return p&&p.enabled===true&&typeof p.device==='string'?p:{enabled:false};}
@@ -485,17 +493,24 @@ function saveInputPreference(preference){
 function inputTokens(){return remapStore.rules.filter(function(r){return r.enabled&&r.trigger.type==='physical';}).map(function(r){return r.trigger.value;});}
 function restoreInput(){
     var preference=inputPreference();
+    if(preference.enabled&&preference.mode==='watch'){
+        if(inputPaused||inputRestoring||!platform.status().agent.connected||!inputTokens().length)return;
+        inputRestoring=true;
+        garageWatch.refresh().then(function(){inputError=null;}).catch(function(e){inputError=e.message;}).finally(function(){inputRestoring=false;});
+        return;
+    }
     if(!preference.enabled||inputPaused||inputRestoring||physical.status().policy.connected||!platform.status().agent.connected||!inputTokens().length)return;
     inputRestoring=true;
     physical.inventory().then(function(list){
         if(inputPaused||inputPreference()!==preference)return;
         var device=list.find(function(d){return d.selectable&&d.name===preference.device&&(d.unique||d.node===preference.node);});
         if(!device)throw new Error('Saved physical remote is unavailable');
-        return physical.start(device.node,'filter',inputTokens());
+        return physical.start(device.node,preference.mode==='watch'?'observe':'filter',inputTokens());
     }).then(function(){inputError=null;}).catch(function(e){inputError=e.message;}).finally(function(){inputRestoring=false;});
 }
-function stopInput(){inputObservers.forEach(function(b){b.stop();});inputObservers=[];physical.stop();}
+function stopInput(){inputObservers.forEach(function(b){b.stop();});inputObservers=[];physical.stop();garageWatch.stop();}
 function inputSnapshot(){
+    if(inputPreference().mode==='watch'&&!inputObservers.length)return Object.assign({},garageWatch.status(),{preference:inputPreference()});
     if(!inputObservers.length)return Object.assign({},physical.status(),{preference:inputPreference()});
     var events=[],connected=false,errors=[];
     inputObservers.forEach(function(b){var s=b.status();events=events.concat(s.events);connected=connected||s.policy.connected;if(s.error)errors.push(s.error);});
@@ -508,6 +523,14 @@ function handleInput(req,res){
         var tokens=inputTokens();
         inputError=null;
         if(p.mode==='off'){try{saveInputPreference({enabled:false});}catch(e){return serveJson(res,{ok:false,error:e.message},503);}inputPaused=false;stopInput();return serveJson(res,{ok:true,persisted:true,status:inputSnapshot()});}
+        if(p.mode==='watch'){
+            inputPaused=true;stopInput();
+            return garageWatch.start().then(function(status){
+                saveInputPreference({enabled:true,device:'all',mode:'watch'});inputPaused=false;
+                serveJson(res,{ok:true,persisted:true,status:Object.assign({},status,{preference:inputPreference()})});
+            }).catch(function(e){garageWatch.stop();serveJson(res,{ok:false,error:e.message},503);});
+        }
+        var watch=false;
         if(p.mode!=='observe'&&p.mode!=='filter')return serveJson(res,{error:'invalid input mode'},400);
         if(p.mode==='filter'&&p.device==='auto')return serveJson(res,{error:'select the detected node before intercepting'},400);
         inputPaused=true;
@@ -523,8 +546,8 @@ function handleInput(req,res){
         if(p.device==='auto')return serveJson(res,{error:'select the detected node before intercepting'},400);
         stopInput();
         physical.start(p.device,p.mode,tokens).then(function(status){
-            if(p.mode==='filter'){saveInputPreference({enabled:true,device:status.policy.device,node:status.policy.node});inputPaused=false;}
-            serveJson(res,{ok:true,persisted:p.mode==='filter',status:inputSnapshot()});
+            if(p.mode==='filter'||watch){saveInputPreference(Object.assign({enabled:true,device:status.policy.device,node:status.policy.node},watch?{mode:'watch'}:{}));inputPaused=false;}
+            serveJson(res,{ok:true,persisted:p.mode==='filter'||watch,status:inputSnapshot()});
         }).catch(function(e){physical.stop();serveJson(res,{ok:false,error:e.message},503);});
     });
 }
@@ -541,15 +564,20 @@ http.createServer(function (req, res) {
     }
     // Packaged widget documents use an opaque (null) origin. Allow only its
     // probe/status exchange, including the JSON POST preflight.
-    if ((url === '/probe' || url === '/status') && req.headers && req.headers.origin === 'null') {
+    // Local change for Garage Home: also keys, TV settings, app launch, running apps and closing an app.
+    if (['/probe', '/status', '/control', '/tv-settings', '/apps/launch', '/monitor', '/components/action', '/garage/inbox', '/proxy'].indexOf(url) >= 0 && req.headers && req.headers.origin === 'null') {
         res.setHeader('Access-Control-Allow-Origin', 'null');
         res.setHeader('Vary', 'Origin');
         if (req.method === 'OPTIONS') {
             res.writeHead(204, {'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-                'Access-Control-Allow-Headers': 'Content-Type'});
+                'Access-Control-Allow-Headers': url === '/garage/inbox' || url === '/proxy' ? 'Content-Type, X-Garage-App' : 'Content-Type'});
             return res.end();
         }
     }
+    // Local change for Garage Player: add a playlist from a phone (setup page, phone POST, TV app collects).
+    if (url === '/garage/setup' && req.method === 'GET') return require('./garage-inbox.js').page(req,res);
+    if (url === '/garage/inbox' && req.method === 'GET') return require('./garage-inbox.js').collect(req,res);
+    if (url === '/garage/inbox' && req.method === 'POST') return require('./garage-inbox.js').post(req,res,readJsonBody);
     if (req.method === 'POST') {
         if (url === '/input') return handleInput(req,res);
         if (url === '/apps/launch') return handleLaunch(req,res);
@@ -587,6 +615,8 @@ http.createServer(function (req, res) {
     if (url === '/control') return handleControl(req, res);
     if (url === '/probe') return handleProbe(req, res);
     if (url === '/input') return handleInput(req,res);
+    // Local change for Garage Home / Garage Player: playlist and EPG fetch for TV apps (opaque origin only).
+    if (url === '/proxy') return require('./garage-inbox.js').fromTvApp(req) ? require('./garage-proxy.js').handle(req,res) : serveJson(res,{error:'TV apps only'},403);
     if (url === '/apps/icon') return handleIcon(req,res);
     if (url === '/apps') return handleApps(req, res);
     if (url === '/blocklist') return handleBlocklist(req, res);
@@ -602,6 +632,10 @@ http.createServer(function (req, res) {
 platform.start();
 // Retry after boot and helper disconnects, including late adapter availability.
 var inputRestoreTimer=setInterval(restoreInput,5000);if(inputRestoreTimer.unref)inputRestoreTimer.unref();
+// Local change for Garage Home: reopen the launcher on wake from standby and after boot.
+require('./garage-autostart.js').start(function(){return platform.status().agent.connected;},function(appId){return runActions([{type:'launch',appId:appId}]);},
+    function(){return agentExecute('vconftool get memory/appfw/current_fullscreen_appid',5000).then(function(r){var m=/value = (\S+)/.exec(r.stdout||'');return m?m[1]:'';});},
+    agentExecute);
 
 // MQTT bridge: publishes telemetry + Home Assistant discovery when a broker
 // is configured (persistent owner config, /tmp fallback). No-op without config.

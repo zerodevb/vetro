@@ -1,12 +1,30 @@
 <!DOCTYPE html>
 <html lang="en">
 <head><meta charset="utf-8"><title>Vetro</title>
-<script src="$WEBAPIS/webapis/webapis.js"></script></head>
+<script src="$WEBAPIS/webapis/webapis.js"></script>
+<style>html.quiet, html.quiet body { background: #0f2326; } html.quiet body > * { display: none; }</style>
+<script type="text/javascript">
+// Local change for Garage Home: opened only to start the service, so show a plain dark screen.
+try {
+  var vetroReq = tizen.application.getCurrentApplication().getRequestedAppControl();
+  if ((vetroReq && vetroReq.appControl.data || []).some(function (d) { return d.key === 'action' && d.value[0] === 'start-service'; })) {
+    document.documentElement.className = 'quiet';
+  }
+} catch (e) {}
+</script></head>
 <body style="font-family:monospace;background:#0d1117;color:#e6edf3">
 <h2>Vetro</h2>
 <p>Dashboard at <code>http://&lt;TV&gt;:8099/</code> · Tizen/Samsung public API probe</p>
 <pre id="out">Starting…</pre>
 <script>
+// Local change for Garage Home: start the background service whenever this app opens (same package,
+// so it is allowed). When Garage Home opens us with action=start-service, close again afterwards.
+(function () {
+  if (typeof tizen === 'undefined') return;
+  var quiet = !!(document.documentElement && document.documentElement.className === 'quiet');
+  var leave = function () { if (quiet) setTimeout(function () { tizen.application.getCurrentApplication().exit(); }, 700); };
+  try { tizen.application.launch('vetrotvapp.svc', leave, leave); } catch (e) { leave(); }
+})();
 var BASE = 'http://127.0.0.1:8099';
 var report = {probe: {}, apps: [], packages: [], settings: {}};
 var out = document.getElementById('out');
