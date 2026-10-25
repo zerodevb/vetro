@@ -9,8 +9,10 @@
 //  - Everyone else pairs once with a 6-digit code that only the TV shows (Garage Home pops it up), then
 //    carries a random key: an HttpOnly SameSite=Strict cookie for browsers, or "Authorization: Bearer"
 //    for scripts. Only SHA-256 hashes of keys are stored.
-//  - The Host must be an IP address or localhost (stops DNS rebinding), and a browser Origin must match
-//    the Host (stops other sites from using a paired browser's cookie).
+//  - A browser Origin must match the Host on pairing and on every paired request (stops other web pages
+//    from starting a pairing or using a paired browser's cookie). The no-key bypass for TV apps also
+//    requires Host to be an IP address or localhost; paired LAN clients may use any host name.
+//  - One pairing at a time: while a code is live, new pairing requests are refused.
 //  - The phone playlist page stays open: it only queues a playlist under the TV's 4-digit code.
 
 var crypto = require('crypto');
@@ -87,6 +89,7 @@ function body(req, cb) {
 
 function startPair(req, res, onPair) {
     var now = Date.now();
+    if (pending && pending.expires > now) return json(res, 429, {error: 'A pairing is in progress; try again when its code expires (at most 2 minutes)'});
     if (now - lastPairAt < 10000) return json(res, 429, {error: 'Wait a few seconds and try again'});
     lastPairAt = now;
     body(req, function (p) {
@@ -133,11 +136,13 @@ function inboxAllowed() {
 
 // Returns true when it has answered the request; false lets Vetro's router handle it.
 function gate(req, res, url, onPair) {
-    if (!hostOk(req)) return json(res, 403, {error: 'Use the TV\'s IP address'}), true;
-    var local = tvApp(req);
+    // The TV-app bypass needs an IP or localhost Host: a rebound hostname on loopback must still pair.
+    var local = tvApp(req) && hostOk(req);
 
-    if (url === '/auth/pair' && req.method === 'POST') return startPair(req, res, onPair), true;
-    if (url === '/auth/confirm' && req.method === 'POST') return confirmPair(req, res), true;
+    if ((url === '/auth/pair' || url === '/auth/confirm') && req.method === 'POST') {
+        if (!originOk(req)) return json(res, 403, {error: 'Cross-site request refused'}), true;
+        return (url === '/auth/pair' ? startPair(req, res, onPair) : confirmPair(req, res)), true;
+    }
     if (url === '/auth/pending' && req.method === 'GET') {
         if (!local) return json(res, 403, {error: 'TV apps only'}), true;
         var live = pending && pending.expires > Date.now();

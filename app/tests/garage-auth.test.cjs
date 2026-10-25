@@ -31,8 +31,11 @@ const tv = {ip: '127.0.0.1', headers: {origin: 'null', host: '127.0.0.1:8099'}};
   assert.equal((await call('POST', '/exec', {ip: '127.0.0.1', headers: {origin: 'http://evil.example', host: '127.0.0.1:8099'}})).code, 401);
   const page = await call('GET', '/');
   assert.equal(page.code, 200); assert.match(page.body, /Pair with your TV/);
-  // DNS rebinding: a hostname in Host is refused even from the TV.
-  assert.equal((await call('GET', '/status', {ip: '127.0.0.1', headers: {host: 'evil.example:8099'}})).code, 403);
+  // DNS rebinding: a hostname on loopback doesn't count as the TV itself, so it needs a key like the LAN.
+  assert.equal((await call('GET', '/status', {ip: '127.0.0.1', headers: {host: 'evil.example:8099'}})).code, 401);
+  // Web pages can't start or finish a pairing.
+  assert.equal((await call('POST', '/auth/pair', {headers: {origin: 'http://evil.example'}, body: {}})).code, 403);
+  assert.equal((await call('POST', '/auth/confirm', {headers: {origin: 'http://evil.example'}, body: {}})).code, 403);
   // The phone page stays open; the TV app collects.
   assert.equal((await call('GET', '/garage/setup')).handled, false);
   assert.equal((await call('POST', '/garage/inbox')).handled, false);
@@ -44,7 +47,8 @@ const tv = {ip: '127.0.0.1', headers: {origin: 'null', host: '127.0.0.1:8099'}};
   assert.equal((await call('GET', '/auth/pending')).code, 403);
   const shown = await call('GET', '/auth/pending', tv);
   assert.match(shown.body.code, /^\d{6}$/); assert.equal(shown.body.name, 'Mac');
-  assert.equal((await call('POST', '/auth/pair', {body: {}})).code, 429);
+  const again1 = await call('POST', '/auth/pair', {body: {}, onPair: () => launched++});
+  assert.equal(again1.code, 429); assert.equal(launched, 1);
   const wrong = String((Number(shown.body.code) + 1) % 1000000).padStart(6, '0');
   assert.equal((await call('POST', '/auth/confirm', {body: {id: start.body.id, code: wrong}})).code, 403);
   const ok = await call('POST', '/auth/confirm', {body: {id: start.body.id, code: shown.body.code}});
@@ -59,6 +63,7 @@ const tv = {ip: '127.0.0.1', headers: {origin: 'null', host: '127.0.0.1:8099'}};
   assert.equal((await call('POST', '/exec', {headers: {authorization: 'Bearer ' + ok.body.token}})).handled, false);
   assert.equal((await call('POST', '/exec', {headers: Object.assign({origin: 'http://evil.example'}, cookie)})).code, 403);
   assert.equal((await call('GET', '/auth/devices', {headers: cookie})).body.devices[0].name, 'Mac');
+  assert.equal((await call('GET', '/status', {headers: {host: 'tv.local:8099', authorization: 'Bearer ' + ok.body.token}})).handled, false);
 
   // Five wrong codes end a pairing.
   auth._reset();
