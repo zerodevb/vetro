@@ -1,5 +1,5 @@
 > **This is a preserved fork for [Garage Home](https://github.com/zerodevb/garage-home) and [Garage Player](https://github.com/zerodevb/garage-player).**
-> Tag [`upstream-e8553f2`](https://github.com/zerodevb/vetro/tree/upstream-e8553f2) is the exact upstream version they were built on; branch `garage` adds remote-key watch, autostart, the phone playlist inbox, a playlist proxy and **pairing sign-in** (`app/service/garage-*.js`).
+> Branch `garage` follows upstream (currently Vetro 0.3.2) and adds remote-key watch, autostart, the phone playlist inbox, a playlist proxy and **pairing sign-in** (`app/service/garage-*.js`). Tag [`upstream-e8553f2`](https://github.com/zerodevb/vetro/tree/upstream-e8553f2) keeps the original version Garage Home was first built and tested on.
 > **Sign-in:** the dashboard and API refuse unpaired network clients. A browser or script pairs once with a 6-digit code shown on the TV, then holds a key (HttpOnly cookie or `Authorization: Bearer`). Apps on the TV itself need no setup. Host names other than IP addresses are refused (DNS rebinding) and cross-site requests are blocked.
 > The original project is [andrearicci93/vetro](https://github.com/andrearicci93/vetro) (MIT). Powered by [TheGarageDevs.com](https://thegaragedevs.com).
 
