@@ -23,6 +23,28 @@ var SELF_START = 'set -e\nmkdir -p /home/owner/share/vetro/startup-backups\n' +
     'sqlite3 -bail ' + DB + ' "BEGIN IMMEDIATE; UPDATE package_app_info SET app_onboot=\'true\', app_autorestart=\'true\' WHERE app_id=\'vetrotvapp.svc\'; COMMIT;"; fi';
 function ensureSelfStart(execute) { return execute(SELF_START, 15000).catch(function () {}); }
 
+// Samsung's Home (the bar over Live TV) is started by the Home key whatever else happens, and then sits behind
+// Garage Home using memory. As Vetro's own launcher does, close it a few times after each Home press, since its
+// start is slow (0.15, 0.45, 0.9, 1.6 and 2.8 s). One background shell; the worst case is the TV as before.
+var SAMSUNG_HOME = 'com.samsung.tv.csfs';
+var HOME_GUARD = '( sleep 0.15; app_launcher -k ' + SAMSUNG_HOME + '; sleep 0.3; app_launcher -k ' + SAMSUNG_HOME +
+    '; sleep 0.45; app_launcher -k ' + SAMSUNG_HOME + '; sleep 0.7; app_launcher -k ' + SAMSUNG_HOME +
+    '; sleep 1.2; app_launcher -k ' + SAMSUNG_HOME + ' ) >/dev/null 2>&1 &';
+function homeGuard(execute) { return execute(HOME_GUARD, 5000).catch(function () {}); }
+
+// "Autorun Smart Hub" opens Samsung's Home at every power-on, in front of Garage Home. Approved by the owner
+// (2026-10-26): switch it off once, keeping the old value in startup-backups/autorun.garage. Turning it back on
+// in the TV's Settings (General > Smart Features) is respected: this only switches it off the first time.
+var AUTORUN_KEY = 'db/menu/smart_hub/ontvsetting/auto_start';
+var AUTORUN_OFF = 'mkdir -p /home/owner/share/vetro/startup-backups\n' +
+    'b=/home/owner/share/vetro/startup-backups/autorun.garage\n' +
+    'if [ ! -f "$b" ]; then v=$(vconftool get ' + AUTORUN_KEY + ' 2>/dev/null | sed -n "s/.*value = \\([0-9]*\\).*/\\1/p"); ' +
+    '[ -n "$v" ] || exit 0; echo "$v" > "$b"; [ "$v" = 1 ] && vconftool set -f -t int ' + AUTORUN_KEY + ' 0; fi; exit 0';
+// Puts the value from before Garage Home back (by hand, or with `node tools/garage-debloat.mjs --restore-autorun`).
+var AUTORUN_RESTORE = 'b=/home/owner/share/vetro/startup-backups/autorun.garage\n' +
+    '[ -f "$b" ] && vconftool set -f -t int ' + AUTORUN_KEY + ' "$(cat "$b")" && rm -f "$b"; exit 0';
+function autorunOff(execute) { return execute(AUTORUN_OFF, 8000).catch(function () {}); }
+
 function powerState(cb) {
     var req = http.get({host: '127.0.0.1', port: 8001, path: '/api/v2/', timeout: 3000}, function (res) {
         var body = '';
@@ -55,7 +77,7 @@ function start(agentReady, launch, foreground, execute) {
         // In standby the TV may freeze this service; a long gap between ticks means we just woke up.
         var now = Date.now(), resumed = now - lastTick > 5000;
         lastTick = now;
-        if (!selfStartDone && execute && agentReady()) { selfStartDone = true; ensureSelfStart(execute); }
+        if (!selfStartDone && execute && agentReady()) { selfStartDone = true; ensureSelfStart(execute).then(function () { return autorunOff(execute); }); }
         powerState(function (state) {
             if (state === 'on' && (previous === 'standby' || resumed)) pendingSince = Date.now();
             if (state) previous = state;
@@ -87,7 +109,10 @@ function watchExits(agentReady, launch, execute) {
             var full = v[0] || '';
             if (full && full !== prev) {
                 var left = prev && !NOT_AN_APP.test(prev) && prev.indexOf(APP_ID) < 0;
-                if (left && TV_SIDE.test(full) && Date.now() - lastLaunch > 3000) { lastLaunch = Date.now(); launch(APP_ID).catch(function () {}); }
+                if (left && TV_SIDE.test(full) && Date.now() - lastLaunch > 3000) {
+                    lastLaunch = Date.now();
+                    launch(APP_ID).catch(function () {}).then(function () { if (full === SAMSUNG_HOME) homeGuard(execute); });
+                }
                 prev = full;
             }
         }, function () {}).then(function () { busy = false; });
@@ -95,4 +120,5 @@ function watchExits(agentReady, launch, execute) {
     if (t.unref) t.unref();
 }
 
-module.exports = {start: start, powerState: powerState, SELF_START: SELF_START, watchExits: watchExits};
+module.exports = {start: start, powerState: powerState, SELF_START: SELF_START, watchExits: watchExits,
+    homeGuard: homeGuard, HOME_GUARD: HOME_GUARD, AUTORUN_OFF: AUTORUN_OFF, AUTORUN_RESTORE: AUTORUN_RESTORE};

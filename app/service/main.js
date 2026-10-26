@@ -514,6 +514,8 @@ var physical=new PhysicalInput(agentExecute,function(event){
 var garageWatch=require('./garage-watch.js').create(PhysicalInput,agentExecute,function(event){
     var actions=remap.resolve(remapStore.rules,'physical',String(event.code));
     if(!actions.length||pendingActions>=8)return;
+    // The key that opens Garage Home (Home) also wakes Samsung's Home: close it behind us.
+    if(actions.some(function(a){return a.type==='launch'&&/^GarageHome\./.test(a.appId||'');}))require('./garage-autostart.js').homeGuard(agentExecute);
     pendingActions++;
     actionQueue=actionQueue.then(function(){return runActions(actions);}).catch(function(e){inputError=e.message;}).finally(function(){pendingActions--;});
 });
