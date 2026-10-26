@@ -17,17 +17,20 @@ try {
 <p>Dashboard at <code>http://&lt;TV&gt;:8099/</code> · Tizen/Samsung public API probe</p>
 <pre id="out">Starting…</pre>
 <script>
-// Local change for Garage Home: start the background service whenever this app opens (same package,
-// so it is allowed). When Garage Home opens us with action=start-service, close again afterwards.
+// Local change for Garage Home: when Garage Home opens us with action=start-service, start the service
+// and close at once (a normal open runs the probe below, which also starts the service).
 (function () {
   if (typeof tizen === 'undefined') return;
-  var quiet = !!(document.documentElement && document.documentElement.className === 'quiet');
-  var leave = function () { if (quiet) setTimeout(function () { tizen.application.getCurrentApplication().exit(); }, 700); };
+  if (!(document.documentElement && document.documentElement.className === 'quiet')) return;
+  var leave = function () { setTimeout(function () { tizen.application.getCurrentApplication().exit(); }, 700); };
   try { tizen.application.launch('vetrotvapp.svc', leave, leave); } catch (e) { leave(); }
 })();
 var BASE = 'http://127.0.0.1:8099';
 var report = {probe: {}, apps: [], packages: [], settings: {}};
 var out = document.getElementById('out');
+var delivered = false;
+// The service keeps running without this page; a resident page only holds memory.
+function leave() { try { tizen.application.getCurrentApplication().exit(); } catch (e) {} }
 function log(line) { out.textContent += '\n' + line; }
 function attempt(name, fn) {
   return new Promise(function (resolve) {
@@ -35,6 +38,16 @@ function attempt(name, fn) {
       Promise.resolve(fn()).then(function (v) { report.probe[name] = {ok: true, value: v}; log('ok   ' + name); resolve(); },
         function (e) { report.probe[name] = {ok: false, error: String(e && e.message || e)}; log('fail ' + name); resolve(); });
     } catch (e) { report.probe[name] = {ok: false, error: String(e && e.message || e)}; log('fail ' + name); resolve(); }
+  });
+}
+// A public-level certificate may not get the on-boot start honored, so the page starts the service itself.
+function launchService() {
+  return cb(function (ok, ko) { tizen.application.launch('vetrotvapp.svc', ok, ko); });
+}
+function reach(tries) {
+  return fetch(BASE + '/status').then(function (r) { return r.status; }, function (e) {
+    if (tries <= 1) throw e;
+    return new Promise(function (resolve) { setTimeout(resolve, 1500); }).then(function () { return reach(tries - 1); });
   });
 }
 function cb(call) { return new Promise(function (ok, ko) { call(ok, ko); }); }
@@ -63,7 +76,9 @@ function tryConnect(port) {
     ws.onerror = function () { clearTimeout(t); reject(new Error('refused')); };
   });
 }
+document.addEventListener('visibilitychange', function () { if (document.hidden && delivered) leave(); });
 var jobs = [
+  ['serviceLaunch', launchService],
   ['tizenObject', function () { return typeof tizen !== 'undefined'; }],
   ['webapisObject', function () { return typeof webapis !== 'undefined'; }],
   ['supportedKeys', function () { return tizen.tvinputdevice.getSupportedKeys().map(function (k) { return k.name; }); }],
@@ -82,13 +97,19 @@ var jobs = [
       return Object.keys(report.settings).length; }],
   ['systeminfoBattery', function () { return cb(function (ok, ko) { tizen.systeminfo.getPropertyValue('BUILD', ok, ko); }); }],
   ['remoteApi8001', function () { return tryConnect(8001); }],
-  ['serviceReach', function () { return fetch(BASE + '/status').then(function (r) { return r.status; }); }]
+  ['serviceReach', function () { return reach(8); }]
 ];
 jobs.reduce(function (p, j) { return p.then(function () { return attempt(j[0], j[1]); }); }, Promise.resolve())
   .then(function () {
     return sendReport();
-  }).then(function (r) { log('\nReport sent to service: ' + r.status + (r.persisted ? ' · saved' : ' · memory only')); },
-    function (e) { log('\nService unreachable: ' + e); });
+  }).then(function (r) {
+    delivered = true;
+    log('\nReport sent to service: ' + r.status + (r.persisted ? ' · saved' : ' · memory only') + '\nClosing in 5 s; the service keeps running.');
+    setTimeout(leave, 5000);
+  }, function (e) {
+    log('\nService unreachable: ' + e);
+    if (report.probe.serviceReach && !report.probe.serviceReach.ok) log('The background service did not answer on port 8099. Is the service installed and started?');
+  });
 </script>
 </body>
 </html>

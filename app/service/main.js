@@ -1,6 +1,8 @@
 'use strict';
 // Vetro application: telemetry, dashboard and feature endpoints.
 // Platform operations use the adapter documented in PLATFORM.md.
+// Tizen 5.5 runs Node 4.4: add the built-ins it lacks before anything else loads.
+require('./compat.js').install();
 var fs = require('fs');
 var http = require('http');
 var os = require('os');
@@ -23,7 +25,9 @@ var monitor = new SystemMonitor(agentExecute);
 var ComponentActions = require('./component-actions.js');
 var dnsFilter = new (require('./local-dns.js').Filter)(agentExecute);
 var homeOrder = new (require('./home-order.js').Order)(agentExecute);
+var dock = new (require('./dock.js').Dock)({execute: agentExecute});
 var hbbtv = new (require('./hbbtv.js').Control)(agentExecute);
+var wins = new (require('./quick-wins.js').Wins)(agentExecute);
 var presence = new (require('./presence.js').Presence)(agentExecute);
 var tvState = new (require('./tv-state.js').Store)(agentExecute);
 var privacy = new (require('./privacy.js').Privacy)(agentExecute);
@@ -32,7 +36,9 @@ var quickSettings = require('./quick-settings.js');
 var leftovers = new (require('./leftovers.js').Leftovers)(agentExecute);
 // Components whose disabled flag Vetro may change: verified ACR set plus Quick Settings groups.
 var TOGGLE_IDS = debloat.VERIFIED_GLOBAL_IDS.concat(quickSettings.ALLOWED_IDS);
-var PORT = Number(process.env.VETRO_PORT) || 8099;
+// The package builder writes a non-default port into build-info.js (VETRO_PORT=... node build.cjs);
+// VETRO_PORT at run time still wins for local runs.
+var PORT = Number(process.env.VETRO_PORT) || buildInfo.port || 8099;
 
 // --- telemetry reader (service side, uid 5001) ---------------------------
 // Reads /proc and /sys directly via fs. No platform command is needed. Every read
@@ -84,6 +90,13 @@ function readTelemetry() {
         try { zones = fs.readdirSync(dir).filter(function (n) { return /^thermal_zone\d+$/.test(n); }).sort(); } catch (e) { zones = []; }
         zones.forEach(function (zone) { if (!temp) temp = tryRead(dir + '/' + zone + '/temp'); });
     });
+    // Samsung's TVs have no Linux thermal zones (nothing under /sys/class/thermal): the SoC driver exposes the
+    // temperature in whole degrees, as <soc>/<name>.thermal/temperature (56 on a Q80A), readable by everyone.
+    if (!temp) {
+        var soc = '/sys/devices/platform/soc', names = [];
+        try { names = fs.readdirSync(soc).filter(function (n) { return /thermal$/.test(n); }).sort(); } catch (e) { names = []; }
+        names.forEach(function (n) { if (!temp) temp = tryRead(soc + '/' + n + '/temperature'); });
+    }
     if (temp) { var t = parseInt(temp, 10); out.soctemp_c = (t > 1000) ? (t / 1000) : t; }
     else out.soctemp_c = null;
 
@@ -107,19 +120,26 @@ function dashboardHtml() { return renderDashboard(); }
 
 var diagnosticPending = null;
 function downloadDiagnostics(res) {
+    // The CPU rate needs a second sample 1.5 s after the first, and the TV runs its commands one after the other:
+    // read together, the sample waited behind the 13 s startup listing and came back without a rate (4 of 7 reports).
+    // The other reads start once the second sample is queued, so it runs right after the first.
+    function later(fn) { return function () { return new Promise(function (r) { setTimeout(r, 1700); }).then(fn); }; }
     if (!diagnosticPending) diagnosticPending = require('./diagnostic-report.js').collect({
         platform: function () { return platform.status(); },
         device: function () { return Object.assign({}, state.settings || {}, {receivedAt: state.receivedAt}); },
-        inventory: function () { return inventory(false); },
-        settings: function () { return tvSettings.read(); },
-        catalog: function () { return menuSettings.load(); },
+        inventory: later(function () { return inventory(false); }),
+        settings: later(function () { return tvSettings.read(); }),
+        catalog: later(function () { return menuSettings.load(); }),
         monitor: function () { return require('./diagnostic-report.js').twoSamples(function (force) { return monitor.snapshot('full', force); }, 1500, 16000).then(function(d){return Object.assign({},d,{telemetry:readTelemetry()});}); },
-        startup: function () { return monitor.startup(); },
-        network: function () { return tvSettings.readNetwork(); },
-        dns: function () { return dnsFilter.status(); },
+        startup: later(function () { return monitor.startup(); }),
+        network: later(function () { return tvSettings.readNetwork(); }),
+        dns: later(function () { return dnsFilter.status(); }),
         mqtt: function () { return bridge.status(); },
-        privacy: function () { return privacy.read(); },
-        hbbtv: function () { return hbbtv.read(); },
+        privacy: later(function () { return privacy.read(); }),
+        hbbtv: later(function () { return hbbtv.read(); }),
+        // The collector treats a truthy "error" as an unreadable section; the launcher keeps its last error there.
+        launcher: later(function () { return dock.status().then(function (d) { return Object.assign({}, d, {error: null, hasError: !!d.error}); }); }),
+        quickWins: later(function () { return wins.read(); }),
         probe: function () { return state; },
         serviceApis: serviceApiProbe
     }).finally(function () { diagnosticPending = null; });
@@ -401,6 +421,19 @@ function handleQuick(req,res) {readJsonBody(req,res,function(p){
     quickSettings.apply(p.id,p.off,{execute:agentExecute,inventory:inventory,invalidate:function(){registryAt=0;}})
         .then(function(d){debloatBusy=false;serveJson(res,d);}).catch(function(e){debloatBusy=false;serveJson(res,{ok:false,error:e.message},e.statusCode||503);});
 });}
+function handleWins(req,res) {readJsonBody(req,res,function(p){
+    if(debloatBusy)return serveJson(res,{ok:false,error:'App change already in progress'},409);debloatBusy=true;
+    wins.apply(p.id,p.on).then(function(d){debloatBusy=false;serveJson(res,d);}).catch(function(e){debloatBusy=false;serveJson(res,{ok:false,error:e.message},409);});
+});}
+// Vetro's own app icon, shown in the dashboard. It ships in the package next to the service folder.
+var iconPng=null;
+function serveIcon(res) {
+    try {
+        if(!iconPng)iconPng=fs.readFileSync(require('path').join(__dirname,'..','icon.png'));
+        res.writeHead(200,{'content-type':'image/png','cache-control':'public, max-age=86400','content-length':iconPng.length});
+        res.end(iconPng);
+    } catch(e) { serveJson(res,{error:'icon unavailable'},404); }
+}
 function handleLeftovers(req,res) {
     if(req.method==='GET')return leftovers.list().then(function(d){serveJson(res,d);}).catch(function(e){serveJson(res,{error:e.message},503);});
     readJsonBody(req,res,function(p){
@@ -503,7 +536,10 @@ function restoreInput(){
     inputRestoring=true;
     physical.inventory().then(function(list){
         if(inputPaused||inputPreference()!==preference)return;
-        var device=list.find(function(d){return d.selectable&&d.name===preference.device&&(d.unique||d.node===preference.node);});
+        var candidates=list.filter(function(d){return d.selectable&&d.name===preference.device;});
+        var keyed=candidates.filter(function(d){try{return /[1-9a-f]/i.test(require('fs').readFileSync('/sys/class/input/'+d.node.split('/').pop()+'/device/capabilities/key','utf8'));}catch(e){return false;}});
+        // Several interfaces share the name: the one that advertises keys, and if more than one does, the saved node among them.
+        var device=candidates.length===1?candidates[0]:keyed.length===1?keyed[0]:keyed.find(function(d){return d.node===preference.node;})||null;
         if(!device)throw new Error('Saved physical remote is unavailable');
         return physical.start(device.node,preference.mode==='watch'?'observe':'filter',inputTokens());
     }).then(function(){inputError=null;}).catch(function(e){inputError=e.message;}).finally(function(){inputRestoring=false;});
@@ -587,7 +623,9 @@ http.createServer(function (req, res) {
         if (url === '/exec') return handleExec(req, res);
         if (url === '/debloat') return handleDebloatAction(req, res);
         if (url === '/dns') return readJsonBody(req,res,function(p){var task=p.action==='observe'?dnsFilter.observe():p.action==='apply'?dnsFilter.apply(p.enabled,p.domains):Promise.reject(Error('Invalid filter action'));task.then(function(d){serveJson(res,d)}).catch(function(e){serveJson(res,{error:e.message},503)});});
-        if (url === '/hbbtv') return readJsonBody(req,res,function(p){hbbtv.change(p.off,p.expected).then(function(d){privacy.cached=null;serveJson(res,d);}).catch(function(e){serveJson(res,{error:e.message},409);});});
+        if (url === '/wins') return handleWins(req,res);
+        if (url === '/hbbtv') return readJsonBody(req,res,function(p){hbbtv.change(p.off,p.expected).then(function(d){privacy.cached=null;try{wins.remember('hbbtv',d.off);}catch(e){}serveJson(res,d);}).catch(function(e){serveJson(res,{error:e.message},409);});});
+        if (url === '/dock') return readJsonBody(req,res,function(p){var t=p.action==='enable'?dock.enable():p.action==='disable'?dock.disable():p.action==='refresh'?dock.refresh():p.action==='fixTizenTube'?dock.setFixTizenTube(p.on):Promise.reject(Error('Invalid dock action'));t.then(function(d){serveJson(res,d)}).catch(function(e){serveJson(res,{ok:false,error:e.message},409)});});
         if (url === '/home-order') return readJsonBody(req,res,function(p){var t=p.action==='restore'?homeOrder.restore():homeOrder.write(p.entries);t.then(function(d){serveJson(res,d)}).catch(function(e){serveJson(res,{error:e.message},409)});});
         if (url === '/tv-menu') return readJsonBody(req,res,function(p){menuSettings.write(p.id,p.value).then(function(d){serveJson(res,d)}).catch(function(e){serveJson(res,{ok:false,error:e.message},409)});});
         if (url === '/tv-settings') return readJsonBody(req,res,function(p){tvSettings.write(p).then(function(d){serveJson(res,d)}).catch(function(e){serveJson(res,{ok:false,error:e.message},409)});});
@@ -603,7 +641,11 @@ http.createServer(function (req, res) {
         return serveJson(res, { error: 'POST not supported here' }, 405);
     }
     if (url === '/dns') return dnsFilter.status().then(function(d){serveJson(res,d)}).catch(function(e){serveJson(res,{error:e.message},503)});
+    if (url === '/dock/icon') {var slug=require('url').parse(req.url,true).query.slug,png=dock.iconFile(slug);if(!png)return serveJson(res,{error:'icon unavailable'},404);res.writeHead(200,{'content-type':'image/png','cache-control':'private, max-age=60','X-Content-Type-Options':'nosniff'});return res.end(png);}
+    if (url === '/dock') return dock.status({preview: true}).then(function(d){serveJson(res,d)}).catch(function(e){serveJson(res,{error:e.message},503)});
     if (url === '/home-order') return homeOrder.read().then(function(d){serveJson(res,d)}).catch(function(e){serveJson(res,{error:e.message},503)});
+    if (url === '/wins') return wins.read().then(function(d){serveJson(res,d)}).catch(function(e){serveJson(res,{error:e.message},503)});
+    if (url === '/icon.png') return serveIcon(res);
     if (url === '/hbbtv') return hbbtv.read().then(function(d){serveJson(res,d);}).catch(function(e){serveJson(res,{error:e.message},503);});
     if (url === '/privacy') return privacy.read().then(function(d){serveJson(res,d)}).catch(function(e){serveJson(res,{error:e.message},503)});
     if (url === '/tv-menu') { var q=/[?&]id=([^&]+)/.exec(req.url||''), menuId=null; try { if(q)menuId=decodeURIComponent(q[1]); } catch(e) { return serveJson(res,{error:'Invalid menu ID'},400); } return (q?menuSettings.read(menuId):menuSettings.load()).then(function(d){serveJson(res,d)}).catch(function(e){serveJson(res,{error:e.message},503)}); }
@@ -633,6 +675,11 @@ http.createServer(function (req, res) {
 });
 
 platform.start();
+// The dock is started again after a boot or a crash while its switch is on.
+// A short tick notices the moment the root agent connects, so after a boot the dock starts at once
+// instead of waiting for the next 10 s round.
+var dockAgentWas=false,dockTicks=0;
+var dockTimer=setInterval(function(){var up=!!platform.status().agent.connected,edge=up&&!dockAgentWas;dockAgentWas=up;if(edge||++dockTicks>=5){dockTicks=0;dock.supervise(up).catch(function(){});}},2000);if(dockTimer.unref)dockTimer.unref();
 // Retry after boot and helper disconnects, including late adapter availability.
 var inputRestoreTimer=setInterval(restoreInput,5000);if(inputRestoreTimer.unref)inputRestoreTimer.unref();
 // Local change for Garage Home: reopen the launcher on wake from standby and after boot.
@@ -670,3 +717,10 @@ var tvStateTimer=setInterval(function(){
 
 // Restore only an explicitly saved local domain filter once the adapter is ready.
 var dnsRestoreAttempts=0;var dnsRestoreTimer=setInterval(function(){if(++dnsRestoreAttempts>12){clearInterval(dnsRestoreTimer);return}if(platform.status().agent.connected){dnsFilter.restore().then(function(s){if(!s.enabled||s.applied)clearInterval(dnsRestoreTimer)}).catch(function(){})}},5000);if(dnsRestoreTimer.unref)dnsRestoreTimer.unref();
+
+// Quick wins that need a task after every boot (HbbTV's flag lives in /tmp, AmbientApp is started by the firmware
+// 15 s after boot). Runs once the adapter is connected; the choice was saved by Vetro when the win was switched on.
+var winsBootAttempts=0;var winsBootTimer=setInterval(function(){if(++winsBootAttempts>60){clearInterval(winsBootTimer);return}if(platform.status().agent.connected){clearInterval(winsBootTimer);wins.boot(hbbtv).catch(function(){})}},5000);if(winsBootTimer.unref)winsBootTimer.unref();
+
+// Put the service's own on-boot and auto-restart flags back once the adapter is connected (see ComponentActions.selfStartup).
+var selfStartupAttempts=0,selfStartupBusy=false;var selfStartupTimer=setInterval(function(){if(++selfStartupAttempts>60){clearInterval(selfStartupTimer);return}if(selfStartupBusy||!platform.status().agent.connected)return;selfStartupBusy=true;inventory(true).then(function(d){if(d.registryError)throw Error(d.registryError);return ComponentActions.selfStartup(d.apps).reduce(function(p,cmd){return p.then(function(){return agentExecute(cmd,30000).then(function(r){registryAt=0;if(r.exit_code||r.timed_out)throw Error(r.stderr||r.stdout||'Startup flag not set')})})},Promise.resolve())}).then(function(){clearInterval(selfStartupTimer)}).catch(function(){}).finally(function(){selfStartupBusy=false})},5000);if(selfStartupTimer.unref)selfStartupTimer.unref();
